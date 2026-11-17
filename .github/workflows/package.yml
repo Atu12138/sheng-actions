@@ -1,0 +1,564 @@
+name: package
+
+# scripts/package.sh of this repository on a macOS runner, with the UniXNU and uefi-sheng
+# checkouts beside it, the layout board.toml names. The platform seed comes from the
+# repository secret UNIXNU_UNIQUE_CHIP_ID and is baked into the images, so the run's
+# artifacts belong to one device alone: download them, then delete the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      os:
+        description: "OS profile of the images"
+        type: choice
+        options: ["27", "26", "17"]
+        default: "27"
+      init_data:
+        description: "Create a NEW installation seed if no saved seed exists (iPadOS 27 only)"
+        type: boolean
+        default: false
+      data_seed_url:
+        description: "Optional original data.dbr URL for an existing installation; otherwise use the saved cache"
+        type: string
+      data_seed_sha256:
+        description: "Required SHA-256 when data_seed_url is supplied"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: db9cd2eb78089dd69e22d35a65e0050d29ab6de1 # UNXNFAT1 payload ramdisk and its UniXNURamDiskDxe decoder
+          path: UniXNU
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          path: uefi-sheng
+          submodules: recursive
+      - name: restore inputs cache
+        id: inputs-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            device/.cache/firmware
+            device/firmware/wcn7850
+          key: sheng-inputs-v2-${{ hashFiles('device/proprietary-files.txt', 'device/board.toml') }}
+          restore-keys: sheng-inputs-v2-
+      - name: stage sheng firmware
+        run: |
+          python3 - <<'PY'
+          import hashlib, pathlib, urllib.request
+          wcn = pathlib.Path('device/firmware/wcn7850')
+          wcn.mkdir(parents=True, exist_ok=True)
+          base = 'https://raw.githubusercontent.com/ianchb/sheng-firmware/ebdd6f89ee5aaa132f03860c211bdfb4294bd954/ath12k/WCN7850/hw2.0/'
+          expected = {
+              'amss.bin': '43aadfd3df887f27de74020273aee484bac6a31dd53068f91baf2a9b094d6a68',
+              'm3.bin': '0e72f44df7defc269fe92dcea25d4d409046c04b77d41c510c52879b3dfc1055',
+              'board-2.bin': '6a98237c743d864773a547e81e23f0c6dc721dcd7331926bee7381e2152e00fd',
+          }
+          for name, digest in expected.items():
+              target = wcn / name
+              if target.is_file() and hashlib.sha256(target.read_bytes()).hexdigest() == digest:
+                  print(f'{name}: cached')
+                  continue
+              with urllib.request.urlopen(base + name, timeout=120) as resp:
+                  data = resp.read()
+              actual = hashlib.sha256(data).hexdigest()
+              if actual != digest:
+                  raise SystemExit(f'firmware SHA-256 mismatch: {name}: {actual}')
+              target.write_bytes(data)
+              print(f'{name}: {actual} (downloaded)')
+          PY
+      - name: stage proprietary firmware
+        working-directory: device
+        run: python3 scripts/extract-files.py
+
+      - name: save inputs cache
+        if: steps.inputs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            device/.cache/firmware
+            device/firmware/wcn7850
+          key: ${{ steps.inputs-cache.outputs.cache-primary-key }}
+      - name: pin the sheng SoC sources required by Bluetooth
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("device/feeds.toml")
+          text = path.read_text()
+          old = 'commit = "a9f45dc60c035084b95463781538380f4c3606c9"'
+          new = 'commit = "2dc650ca76ae38715cd0712e60a44b14fe251745"'
+          if old in text:
+              path.write_text(text.replace(old, new, 1), newline="\n")
+          elif new not in text:
+              raise SystemExit("unexpected SM8550 source pin")
+          PY
+      - name: cache Ath12kWifi sources
+        uses: actions/cache@v4
+        with:
+          path: device/drivers/Ath12kWifi/deps
+          key: ath12k-sources-${{ hashFiles('device/drivers/Ath12kWifi/tools/source-lock.json') }}
+      - name: repair Ath12kWifi sparse checkout paths
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("device/drivers/Ath12kWifi/tools/fetch-sources.py")
+          text = path.read_text()
+          old = 'subprocess.run(["git", "-C", str(directory), "sparse-checkout", "add", *source["paths"]], check=True)'
+          new = 'subprocess.run(["git", "-C", str(directory), "sparse-checkout", "add", "--skip-checks", *paths], check=True)'
+          if old in text:
+              path.write_text(text.replace(old, new, 1), newline="\n")
+          else:
+              print("sparse-checkout repair: no change needed")
+          PY
+      - name: fetch Ath12kWifi sources
+        run: device/drivers/Ath12kWifi/tools/fetch-sources.sh
+      - name: repair the pinned Mesa diagnostics patch
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          patch = Path("UniXNU/patches/mesa/turnip-frame-diagnostics.patch")
+          text = patch.read_text()
+          old = "diff --git a/src/freedreno/vulkan/tu_frame_diagnostic.h b/src/freedreno/vulkan/tu_frame_diagnostic.h\n--- /dev/null\n"
+          new = "diff --git a/src/freedreno/vulkan/tu_frame_diagnostic.h b/src/freedreno/vulkan/tu_frame_diagnostic.h\nnew file mode 100644\n--- /dev/null\n"
+          if new not in text:
+              if old not in text:
+                  raise SystemExit("unexpected diagnostics patch header")
+              patch.write_text(text.replace(old, new, 1), newline="\n")
+          PY
+      - name: backport the reference-kernel cache-input stub
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("UniXNU/scripts/build-fileset-release-reference.py")
+          text = path.read_text()
+          old = "native_[a-z0-9_]+|boot_log_rounds)"
+          new = "native_[a-z0-9_]+|boot_log_rounds|boot_cache_input_capture)"
+          if old in text:
+              path.write_text(text.replace(old, new, 1), newline="\n")
+          elif new not in text:
+              raise SystemExit("unexpected reference-kernel stub matcher")
+          PY
+      - name: backport the XnuPrelink bang-root exclusion
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("UniXNU/kits/XnuPrelink/fileset_emit.py")
+          text = path.read_text()
+          marker = "excluded = {root[1:] for root in roots if root.startswith('!')}"
+          if marker not in text:
+              edits = [
+                  (
+                      "    closure, pending = set(), list(roots)\n",
+                      "    # A root written !bundle.id leaves that dependency out, for a kext that only names it in a metaclass comparison: its\n"
+                      "    # OSDynamicCast finds nothing, and rebase_collection takes it off the retained kexts' library lists.\n"
+                      "    excluded = {root[1:] for root in roots if root.startswith('!')}\n"
+                      "    closure, pending = set(), [root for root in roots if not root.startswith('!')]\n",
+                  ),
+                  (
+                      "        if identifier in closure:\n",
+                      "        if identifier in closure or identifier in excluded:\n",
+                  ),
+                  (
+                      "            dropped_personalities.append(entry['CFBundleIdentifier'])\n",
+                      "            dropped_personalities.append(entry['CFBundleIdentifier'])\n"
+                      "        for root in roots or ():\n"
+                      "            if root.startswith('!') and root[1:] in (entry.get('OSBundleLibraries') or {}):\n"
+                      "                del entry['OSBundleLibraries'][root[1:]]\n",
+                  ),
+              ]
+              for old, new in edits:
+                  if text.count(old) != 1:
+                      raise SystemExit(f"unexpected XnuPrelink context: {old!r}")
+                  text = text.replace(old, new, 1)
+              path.write_text(text, newline="\n")
+          PY
+      - name: review the IOSerialFamily ABI data
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("UniXNU/kits/XnuPrelink/fixtures/fileset-24A446-symbols.json")
+          record = json.loads(path.read_text())
+          expected = "38e6d9fa5f789b8228f4617ef4c6d2a3fd8ab564abdc9b62920f1db53fc1780a"
+          if record["inputs"]["kernelcache_sha256"] != expected:
+              raise SystemExit("unexpected 24A446 kernelcache fixture")
+
+          entries = [
+              {
+                  "original": "0xfffffe000b89bfa8",
+                  "native_symbol": "_linesw",
+                  "addend": 0,
+                  "evidence": (
+                      "IOSerialFamily __got slot 0xfffffe0008399d08 holds chained-fixup "
+                      "offset 0x484c2b8; with the 24A446 kernel base 0xfffffe0007004000 it "
+                      "resolves to 0xfffffe000b89bfa8, the tty line-discipline table. The "
+                      "H fileset build carries the same IOSerialFamily binary and the same "
+                      "16-slot GOT at 0xfffffff008399ca8; its slot 12 resolves to _linesw at "
+                      "0xfffffff00b8502b8. The intervening slots resolve to the OSDictionary, "
+                      "OSNumber, OSString and OSSymbol metaClass pointers, IOService "
+                      "gMetaClass/metaClass/vtable, __stack_chk_guard, gIOKitDebug, "
+                      "gIOKitDebugKey, gIOServicePlane, gPESerialBaud, _tk_nin and "
+                      "_tk_rawcc, which fixes the slot order. Source: bsd/kern/tty_conf.c "
+                      "defines struct linesw linesw[MAXLDISC]."
+                  ),
+              },
+              {
+                  "original": "0xfffffe000b89fe14",
+                  "native_symbol": "_gPESerialBaud",
+                  "addend": 0,
+                  "evidence": (
+                      "IOSerialFamily __got slot 0xfffffe0008399d00 resolves to "
+                      "0xfffffe000b89fe14; its bytes are ff ff ff ff, the -1 initializer of "
+                      "gPESerialBaud. The H fileset build's slot 11 resolves to "
+                      "_gPESerialBaud at 0xfffffff00b858e1c, with the same ff ff ff ff "
+                      "bytes and the same neighbouring slots. Source: "
+                      "pexpert/gen/pe_gen.c defines int32_t gPESerialBaud = -1."
+                  ),
+              },
+              {
+                  "original": "0xfffffe000b914a18",
+                  "native_symbol": "_tk_rawcc",
+                  "addend": 0,
+                  "evidence": (
+                      "IOSerialFamily __got slot 0xfffffe0008399d18 resolves to the "
+                      "zero-initialized 0xfffffe000b914a18. The H fileset build's slot 14 "
+                      "resolves to _tk_rawcc at 0xfffffff00b91c6d0, also zero. The code at "
+                      "0xfffffe000a3baee4 loads the two counters through slots 0x8399d10 "
+                      "and 0x8399d18, adds the same input increment to both, then updates "
+                      "tty +0x40. Source: bsd/sys/dkstat.h declares extern long tk_rawcc; "
+                      "bsd/kern/bsd_init.c defines it and bsd/kern/tty.c:509 increments it."
+                  ),
+              },
+              {
+                  "original": "0xfffffe000b914a20",
+                  "native_symbol": "_tk_nin",
+                  "addend": 0,
+                  "evidence": (
+                      "IOSerialFamily __got slot 0xfffffe0008399d10 resolves to the "
+                      "zero-initialized 0xfffffe000b914a20. The H fileset build's slot 13 "
+                      "resolves to _tk_nin at 0xfffffff00b91c6c0, also zero. It is the "
+                      "second counter in the same tty input path as _tk_rawcc. Source: "
+                      "bsd/sys/dkstat.h declares extern long tk_nin; bsd/kern/bsd_init.c "
+                      "defines it and bsd/kern/tty.c:512 increments it."
+                  ),
+              },
+              {
+                  "original": "0xfffffe000b9296e8",
+                  "native_symbol": "_gIOKitDebugKey",
+                  "addend": 0,
+                  "evidence": (
+                      "IOSerialFamily __got slot 0xfffffe0008399cf0 resolves to the "
+                      "zero-initialized 0xfffffe000b9296e8. The H fileset build's slot 9 "
+                      "resolves to _gIOKitDebugKey at 0xfffffff00b944570, also zero until "
+                      "IOService::initialize publishes the IOKitDebug OSSymbol. The use "
+                      "point at 0xfffffe000a3b85e8 reads this global and passes it to the "
+                      "IOService property lookup. Source: iokit/IOKit/IOService.h declares "
+                      "extern const OSSymbol *gIOKitDebugKey."
+                  ),
+              },
+          ]
+
+          known = {entry["original"].lower(): entry for entry in record["data"]}
+          for entry in entries:
+              old = known.get(entry["original"].lower())
+              if old is None:
+                  record["data"].append(entry)
+              elif old.get("native_symbol") != entry["native_symbol"]:
+                  raise SystemExit(
+                      f"conflicting reviewed data for {entry['original']}: "
+                      f"{old.get('native_symbol')} != {entry['native_symbol']}"
+                  )
+          path.write_text(json.dumps(record, indent=2, ensure_ascii=False) + "\n", newline="\n")
+          print(f"reviewed IOSerialFamily data: {len(record['data'])} entries")
+          PY
+      - name: allow the reviewed USB and serial stubs
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path("UniXNU/scripts/policies/ipados-27.0.1-24A446/prelink-regression.json")
+          policy = json.loads(path.read_text())
+          expected = "38e6d9fa5f789b8228f4617ef4c6d2a3fd8ab564abdc9b62920f1db53fc1780a"
+          if policy["kernelcache_sha256"] != expected:
+              raise SystemExit("unexpected 24A446 prelink policy")
+
+          additions = {
+              "com.apple.driver.AppleUSBDeviceMux": [
+                  "0xfffffe000b29ad68",
+                  "0xfffffe000b29ae08",
+                  "0xfffffe000b29ae38",
+              ],
+              "com.apple.iokit.IOAccessoryManager": [
+                  "0xfffffe000b29c7cc",
+                  "0xfffffe000b553aec",
+              ],
+              "com.apple.iokit.IOSerialFamily": [
+                  "0xfffffe000b2bb0b8",
+                  "0xfffffe000b3d1ec0",
+              ],
+          }
+          for owner, targets in additions.items():
+              bucket = policy["stubbed"].setdefault(owner, {})
+              for target in targets:
+                  bucket.setdefault(target, 1)
+          policy["description"] = (
+              "Remaining unresolved references of the 24A446 startup baseline. "
+              "This bounds regressions, not runtime qualification. The USBDeviceMux, "
+              "IOAccessoryManager and IOSerialFamily stubs are references to base-kernel "
+              "functions that the native 4 KiB build does not provide."
+          )
+          path.write_text(json.dumps(policy, indent=2) + "\n", newline="\n")
+          print(f"reviewed prelink stubs: {sum(len(v) for v in policy['stubbed'].values())} entries")
+          PY
+      - name: shrink the UFS static scratch buffer
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("device/drivers/ShengUfs/RootLayout.h")
+          text = path.read_text()
+          old = "static uint8_t gScratch[kDataMax];"
+          new = """#ifdef KERNEL
+          // Allocated by the first layout parse: the kernel's static data does not carry 128 KiB. The host test keeps the array.
+          static uint8_t *gScratch;
+          #else
+          static uint8_t gScratch[kDataMax];
+          #endif"""
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif "static uint8_t *gScratch;" not in text:
+              raise SystemExit("unexpected ShengUfs scratch declaration")
+          marker = "static bool findRootLayout (RootLayout *layout, const char **why)\n{\n"
+          allocation = marker + """#ifdef KERNEL
+            if (!gScratch && !(gScratch = static_cast<uint8_t *>(IOMallocData(kDataMax)))) {
+              *why = "scratch allocation";
+              return false;
+            }
+          #endif
+          """
+          if marker in text:
+              text = text.replace(marker, allocation, 1)
+          elif '*why = "scratch allocation";' not in text:
+              raise SystemExit("unexpected ShengUfs layout entry")
+          path.write_text(text, newline="\n")
+          PY
+      - name: report the prelink layout bounds
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("UniXNU/kits/XnuPrelink/fileset_layout.py")
+          text = path.read_text()
+          old = "            raise ValueError('Native code would collide with collection data')"
+          new = ("            raise ValueError(f'Native code would collide with collection data: "
+                 "code_end={code_end:#x} data={self.roots[\"__DATA\"][\"va\"]:#x} "
+                 "over={code_end - self.roots[\"__DATA\"][\"va\"]:#x}')")
+          if old in text:
+              text = text.replace(old, new, 1)
+          elif new not in text:
+              raise SystemExit("unexpected XnuPrelink layout collision check")
+          marker = "        self.size = self.cursor\n        self.validate()\n"
+          replacement = '''        self.size = self.cursor
+                  for segment in self.native.segments:
+                      if segment['size']:
+                          print(f"layout native {segment['name']}: size={segment['size']:#x} filesize={segment['filesize']:#x}")
+                  data = self.segment('__DATA')
+                  data_start = self.placements['__DATA']
+                  data_end = data_start + data['size']
+                  data_root = self.roots['__DATA']
+                  print(f"layout root __DATA: va={data_root['va']:#x} size={data_root['size']:#x}")
+                  retained = sorted((begin, end) for begin, end in self.occupied
+                                    if data_root['va'] <= begin < data_root['va'] + data_root['size'])
+                  overlapping = [(begin, end) for begin, end in retained
+                                 if data_start < end and begin < data_end]
+                  if overlapping:
+                      begin, end = overlapping[0]
+                      print(f"layout __DATA: start={data_start:#x} end={data_end:#x} "
+                            f"first_retained={begin:#x}..{end:#x} over={data_end - begin:#x}")
+                  else:
+                      print(f"layout __DATA: start={data_start:#x} end={data_end:#x} no retained overlap")
+                  try:
+                      self.validate()
+                  except ValueError as error:
+                      if overlapping:
+                          begin, end = overlapping[0]
+                          raise ValueError(f"{error}: native __DATA=[{data_start:#x},{data_end:#x}) "
+                                           f"retained={begin:#x}..{end:#x} over={data_end - begin:#x}") from error
+                      raise
+          '''
+          if marker in text:
+              text = text.replace(marker, replacement, 1)
+          elif "layout native" not in text:
+              raise SystemExit("unexpected XnuPrelink layout validation")
+          path.write_text(text, newline="\n")
+          PY
+      - name: tools
+        run: |
+          brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup blacktop/tap/ipsw
+          {
+            echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+          } >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          # Fail fast, naming the tool, before forty minutes of build.
+          ok=1
+          for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput aea compression_tool \
+                   mformat mcopy ipsw; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          for t in lld-link llvm-lib llvm-rc llvm-nm llvm-objcopy; do
+            [ -f "/opt/homebrew/opt/llvm/bin/$t" ] || [ -f "/opt/homebrew/opt/lld/bin/$t" ] || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+      - name: platform seed
+        env:
+          seed: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          if ! [[ "$seed" =~ ^[0-9a-fA-F]{8}$ ]]; then
+            echo 'Set the repository secret UNIXNU_UNIQUE_CHIP_ID: the platform seed of the device, 8 hex digits.' >&2
+            exit 1
+          fi
+      - name: seed cache identity
+        id: seed-key
+        env:
+          SEED: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write('key=data-seed-v1-' + hashlib.sha256(os.environ['SEED'].encode()).hexdigest()[:16] + '\n')
+          PY
+      - uses: actions/cache/restore@v4
+        id: data-cache
+        if: inputs.os == '27'
+        with:
+          path: |
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/inputs.json
+          key: ${{ steps.seed-key.outputs.key }}-${{ inputs.os }}
+      - name: prepare preserved Data seed
+        if: inputs.os == '27'
+        env:
+          INIT_DATA: ${{ inputs.init_data }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request
+          inputs = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())['inputs']
+          path = pathlib.Path('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr')
+          url, digest = inputs.get('data_seed_url', ''), inputs.get('data_seed_sha256', '').lower()
+          if url:
+              print('::add-mask::' + url)
+              if not url.startswith('https://') or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+                  raise SystemExit('A seed URL requires HTTPS and its SHA-256')
+              with urllib.request.urlopen(url, timeout=120) as source:
+                  data = source.read(64 * 1024 * 1024 + 1)
+              if len(data) > 64 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+                  raise SystemExit('Seed size or SHA-256 mismatch')
+              if path.exists() and path.read_bytes() != data:
+                  raise SystemExit('Saved seed differs; preserve and inspect it instead of replacing this installation')
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+          if not path.is_file() and os.environ['INIT_DATA'] != 'true':
+              raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
+          PY
+      - name: package
+        working-directory: device
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          INIT_DATA: ${{ inputs.init_data }}
+          OS_PROFILE: ${{ inputs.os }}
+        run: |
+          args=(--os "$OS_PROFILE" --uefi ../uefi-sheng)
+          if [ "$OS_PROFILE" = 27 ] && [ "$INIT_DATA" = true ]; then
+            args+=(--init-data)
+          fi
+          scripts/package.sh "${args[@]}"
+      - name: native prelink failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-prelink-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: warn
+          path: |
+            UniXNU/out/sheng/*/*/tree/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/mach.development.bcm2837.unstripped.noctf
+            UniXNU/out/sheng/*/*/logs/prelink.log
+            UniXNU/out/sheng/*/*/tree/kits/XnuPrelink/fileset_layout.py
+            UniXNU/out/sheng/*/*/kernel/kernel.failed.json
+      - name: runtime and package log backup
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-logs-27
+          retention-days: 3
+          if-no-files-found: ignore
+          path: |
+            UniXNU/out/sheng/*/*/logs/*.log
+            UniXNU/out/sheng/*/*/runtime/request.json
+
+      - name: fileset-reference failure diagnostics
+        if: failure()
+        run: |
+          find UniXNU/out/sheng -path '*/build/xnu/fileset-reference/*/*-build.log' -type f -print0 2>/dev/null |
+          while IFS= read -r -d '' log; do
+            echo "::group::${log} (tail)"
+            tail -n 400 "$log" || true
+            echo "::endgroup::"
+          done
+      - name: kernel failure diagnostics
+        if: failure()
+        run: |
+          find UniXNU/out/sheng -path '*/logs/kernel.log' -type f -print0 2>/dev/null |
+          while IFS= read -r -d '' log; do
+            echo "::group::${log} (tail)"
+            tail -n 600 "$log" || true
+            echo "::endgroup::"
+          done
+      - uses: actions/cache/save@v4
+        if: always() && inputs.os == '27' && steps.data-cache.outputs.cache-hit != 'true' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
+        with:
+          path: |
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr
+            UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/inputs.json
+          key: ${{ steps.seed-key.outputs.key }}-${{ inputs.os }}
+      - name: installation seed backup
+        if: always() && inputs.os == '27' && hashFiles('UniXNU/out/sheng/ipados-27.0.1-24A446/sheng_ipados27/runtime/data.dbr') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: installation-seed-${{ inputs.os }}
+          retention-days: 1
+          path: |
+            UniXNU/out/sheng/*/*/runtime/data.dbr
+            UniXNU/out/sheng/*/*/runtime/inputs.json
+      - name: images
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-${{ inputs.os }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            UniXNU/out/sheng/*/*/boot/boot.img
+            UniXNU/out/sheng/*/*/payload/payload.img
+            UniXNU/out/sheng/*/*/kernel/kernel.macho
+            UniXNU/out/sheng/*/*/package.manifest.json

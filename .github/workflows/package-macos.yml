@@ -1,0 +1,549 @@
+name: package-macos
+
+# scripts/package.sh with the macOS 27.3 (26C5035r) profile on a macOS runner, plus the userdata root image
+# that profile boots from. The UniXNU checkout is pinned at a revision that carries profiles/os/macos-27.3-26C5035r
+# (package.yml pins an older one for the iPadOS profiles).
+#
+# Jobs:
+#   boot      boot.img, payload.img, kernel.macho and the manifest. The platform seed comes from the repository
+#             secret UNIXNU_UNIQUE_CHIP_ID and is baked into the images.
+#   userdata  userdata-root.img: the OS, SystemOS and App disk images of the IPSW behind the SHNGROOT manifest,
+#             for `fastboot flash userdata`. It does not depend on the seed and runs on its own runner for disk space.
+#
+# The Data seed (data.dbr) is installation state: the first build of an installation creates it (init_data), later
+# builds must reuse the same seed (Actions cache, or data_seed_url). Every run uploads it as a backup artifact.
+# The artifacts belong to one device and derive from Apple software: download them, then delete the run.
+
+on:
+  workflow_dispatch:
+    inputs:
+      init_data:
+        description: "FIRST installation: create a new macOS Data seed when no saved seed exists"
+        type: boolean
+        default: true
+      skip_setup:
+        description: "New seed only: mark Setup Assistant done (uses MACOS_USER secret or unixnu:unixnu)"
+        type: boolean
+        default: true
+      userdata:
+        description: "Also build userdata-root.img (about 16.5 GB, needed once for the first installation)"
+        type: boolean
+        default: false
+      boot_runner:
+        description: "Runner for the boot job (macos-26 has Xcode 26 and arm64 Data template)"
+        type: choice
+        options: ["macos-26", "macos-15-intel", "macos-15", "macos-14", "macos-latest", "self-hosted"]
+        default: "macos-26"
+      userdata_runner:
+        description: "Runner for the userdata job (macos-26 or macos-15-intel)"
+        type: choice
+        options: ["macos-26", "macos-15-intel", "macos-15", "macos-14", "macos-latest", "self-hosted"]
+        default: "macos-26"
+      data_seed_url:
+        description: "Optional original data.dbr URL for an existing installation; otherwise use the saved cache"
+        type: string
+      data_seed_sha256:
+        description: "Required SHA-256 when data_seed_url is supplied"
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: package-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  OS_PROFILE: macos-27.3-26C5035r
+  # out/<board>/<os profile>/<defconfig without _defconfig>, from board.toml [package.defconfig].
+  WORK: UniXNU/out/sheng/macos-27.3-26C5035r/sheng_macos
+  UNIXNU_REF: d8210e089792946841ca23a8ff39f3b3641b002f
+  HOMEBREW_NO_AUTO_UPDATE: 1
+  HOMEBREW_NO_INSTALL_CLEANUP: 1
+
+defaults:
+  run:
+    # bash -eo pipefail: the package step's tee must not hide a failed build.
+    shell: bash
+
+jobs:
+  boot:
+    runs-on: ${{ inputs.boot_runner }}
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ env.UNIXNU_REF }}
+          path: UniXNU
+          submodules: recursive
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/uefi-sheng
+          path: uefi-sheng
+          submodules: recursive
+      - name: patch uefi-sheng memory map and boot guard
+        run: |
+          # 1. Copy BootResetCore.h for ShengBootGuard
+          cp device/package/BootResetCore.h uefi-sheng/Platforms/Xiaomi/shengPkg/Include/BootResetCore.h
+
+          # 2. Patch MemoryMapLib.c and ShengPlatformSecLib
+          python3 - <<'PY'
+          from pathlib import Path
+          mmap = Path('uefi-sheng/Platforms/Xiaomi/shengPkg/Library/MemoryMapLib/MemoryMapLib.c')
+          content = mmap.read_text()
+          old_gap = '{"DRAM gap 0xE671D000", 0xE671D000, 0x190E3000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},'
+          new_gap = '{"tz-ext-region@e671d000", 0xE671D000, 0x01593000, HobOnlyNoCacheSetting, MEM_RES, UNCACHEABLE, Reserv, UNCACHED_UNBUFFERED_XN},\n  {"DRAM gap 0xE7CB0000", 0xE7CB0000, 0x17B50000, AddMem, SYS_MEM, SYS_MEM_CAP, Conv, WRITE_BACK_XN},'
+          if old_gap not in content:
+              raise SystemExit("MemoryMapLib.c target pattern not found")
+          content = content.replace(old_gap, new_gap)
+          mmap.write_text(content)
+          print("Patched MemoryMapLib.c DRAM gap 0xE7CB0000 and tz-ext-region")
+
+          for f in Path('uefi-sheng').rglob('*'):
+              if f.is_file() and f.suffix in ('.c', '.h'):
+                  txt = f.read_text(errors='ignore')
+                  modified = False
+                  if 'BR_WDT_TIMEOUT_MS' in txt and '#include "BootResetCore.h"' not in txt and f.name.endswith('.h'):
+                      txt = '#include "BootResetCore.h"\n' + txt
+                      modified = True
+                  if 'ShengWatchdogCall (0x84000009' in txt:
+                      txt = txt.replace('ShengWatchdogCall (0x84000009, 0, 0);', '// ShengWatchdogCall (0x84000009, 0, 0);')
+                      modified = True
+                      print(f"Disabled abort-on-error in {f}")
+                  if modified:
+                      f.write_text(txt)
+          PY
+      - name: disk space
+        run: |
+          df -h "$GITHUB_WORKSPACE"
+          # The Android SDK is not used by this build and takes several GB.
+          rm -rf "$HOME/Library/Android" || true
+          df -h "$GITHUB_WORKSPACE"
+      - name: tools
+        run: |
+          brew_prefix=$(brew --prefix)
+          if [ ! -e /opt/homebrew ] && [ "$brew_prefix" != "/opt/homebrew" ]; then
+            sudo mkdir -p /opt
+            sudo ln -s "$brew_prefix" /opt/homebrew
+          fi
+          if ! xcodebuild -version | grep -q '^Xcode 26'; then
+            echo "CCC_OVERRIDE_OPTIONS=# +-Wno-unknown-warning-option +-Wno-error=unknown-warning-option +-Wno-missing-designated-field-initializers +-Wno-unused-but-set-global" >> "$GITHUB_ENV"
+          fi
+          brew tap blacktop/tap
+          brew trust blacktop/tap || true
+          brew install dtc llvm lld cmake mtools ninja glslang shaderc spirv-tools bison pkgconf rustup
+          brew install --formula blacktop/tap/ipsw
+          export PATH="/opt/homebrew/opt/rustup/bin:$HOME/.cargo/bin:/opt/homebrew/opt/llvm/bin:/opt/homebrew/opt/lld/bin:/opt/homebrew/opt/bison/bin:$PATH"
+          {
+            echo "/opt/homebrew/opt/rustup/bin"
+            echo "$HOME/.cargo/bin"
+            echo "/opt/homebrew/opt/llvm/bin"
+            echo "/opt/homebrew/opt/lld/bin"
+            echo "/opt/homebrew/opt/bison/bin"
+          } >> "$GITHUB_PATH"
+          rustup toolchain install 1.98.0 --profile minimal --component rust-src
+          rustup default 1.98.0
+          cargo +1.98.0 --version
+          ok=1
+          for t in clang xcodebuild make git ninja cmake dtc fdtget fdtput aea compression_tool \
+                   mformat mcopy ipsw hdiutil cargo rustc; do
+            command -v "$t" >/dev/null || { echo "missing tool: $t"; ok=0; }
+          done
+          for t in lld-link llvm-lib llvm-rc llvm-nm llvm-objcopy; do
+            [ -f "/opt/homebrew/opt/llvm/bin/$t" ] || [ -f "/opt/homebrew/opt/lld/bin/$t" ] || { echo "missing tool: $t"; ok=0; }
+          done
+          [ "$ok" = 1 ]
+          bridge_script="UniXNU/scripts/build-adreno-metal-bridge.py"
+          [ -f "$bridge_script" ] || bridge_script="../UniXNU/scripts/build-adreno-metal-bridge.py"
+          if [ -f "$bridge_script" ]; then
+            sed -i '' 's/timeout=1800/timeout=3600/g' "$bridge_script"
+          fi
+          payload_script="UniXNU/scripts/unixnu/payload.py"
+          [ -f "$payload_script" ] || payload_script="../UniXNU/scripts/unixnu/payload.py"
+          if [ -f "$payload_script" ]; then
+            sed -i '' 's/1024 \* 0\.95/1024 * 0.99/' "$payload_script"
+          fi
+      - name: platform seed
+        env:
+          seed: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          if ! [[ "$seed" =~ ^[0-9a-fA-F]{8}$ ]]; then
+            echo 'Set the repository secret UNIXNU_UNIQUE_CHIP_ID: the platform seed of the device, 8 hex digits.' >&2
+            exit 1
+          fi
+      - name: seed cache identity
+        id: seed-key
+        env:
+          SEED: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, os
+          h = hashlib.sha256(os.environ['SEED'].encode()).hexdigest()[:16]
+          rid = os.environ['GITHUB_RUN_ID']
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as out:
+              out.write(f'key=data-seed-v4-40g-{h}-macos27-{rid}\n')
+              out.write(f'restore=data-seed-v4-40g-{h}-macos27-\n')
+          PY
+      - uses: actions/cache/restore@v4
+        id: data-cache
+        if: ${{ !inputs.init_data }}
+        with:
+          path: |
+            ${{ env.WORK }}/runtime/data.dbr
+            ${{ env.WORK }}/runtime/inputs.json
+          key: ${{ steps.seed-key.outputs.key }}
+          restore-keys: |
+            ${{ steps.seed-key.outputs.restore }}
+      - name: prepare preserved Data seed
+        env:
+          INIT_DATA: ${{ inputs.init_data }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, json, os, pathlib, urllib.request
+          inputs = json.loads(pathlib.Path(os.environ['GITHUB_EVENT_PATH']).read_text())['inputs']
+          path = pathlib.Path(os.environ['WORK']) / 'runtime/data.dbr'
+          url, digest = inputs.get('data_seed_url', ''), inputs.get('data_seed_sha256', '').lower()
+          if url:
+              print('::add-mask::' + url)
+              if not url.startswith('https://') or len(digest) != 64 or any(c not in '0123456789abcdef' for c in digest):
+                  raise SystemExit('A seed URL requires HTTPS and its SHA-256')
+              with urllib.request.urlopen(url, timeout=120) as source:
+                  data = source.read(512 * 1024 * 1024 + 1)
+              if len(data) > 512 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != digest:
+                  raise SystemExit('Seed size or SHA-256 mismatch')
+              if path.exists() and path.read_bytes() != data:
+                  raise SystemExit('Saved seed differs; preserve and inspect it instead of replacing this installation')
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_bytes(data)
+          elif os.environ['INIT_DATA'] == 'true':
+              path.unlink(missing_ok=True)
+              (path.parent / 'inputs.json').unlink(missing_ok=True)
+          if not path.is_file() and os.environ['INIT_DATA'] != 'true':
+              raise SystemExit('No saved seed. Supply the ORIGINAL seed for an existing installation, or select init_data for a FIRST installation')
+          PY
+      - uses: actions/cache/restore@v4
+        id: policy-cache
+        with:
+          path: device/scripts/policies/macos-27.3-26C5035r
+          key: verified-root-policies-v1-macos-27.3-26C5035r
+      - name: restore inputs cache
+        id: inputs-cache
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            device/.cache/firmware
+            device/firmware/wcn7850
+          key: sheng-inputs-v2-${{ hashFiles('device/proprietary-files.txt', 'device/board.toml') }}
+          restore-keys: sheng-inputs-v2-
+      - name: board firmware and Wi-Fi inputs
+        working-directory: device
+        run: |
+          python3 scripts/extract-files.py
+          for attempt in 1 2 3 4 5 6; do
+            python3 scripts/download-sheng-firmware.py --connections 8 && break
+            if [ "$attempt" -eq 6 ]; then exit 1; fi
+            echo "download-sheng-firmware.py attempt $attempt failed; waiting 10s before resuming..."
+            sleep 10
+          done
+          python3 scripts/extract-sheng-firmware.py
+          python3 - <<'PY'
+          import hashlib, json, pathlib, urllib.request
+          wcn = pathlib.Path('firmware/wcn7850')
+          manifest = json.loads((wcn / 'manifest.json').read_text())['files']
+          base = 'https://raw.githubusercontent.com/ianchb/sheng-firmware/ebdd6f89ee5aaa132f03860c211bdfb4294bd954/ath12k/WCN7850/hw2.0/'
+          for name, expected in manifest.items():
+              target = wcn / name
+              if target.is_file() and target.stat().st_size == expected['bytes'] and hashlib.sha256(target.read_bytes()).hexdigest() == expected['sha256']:
+                  continue
+              with urllib.request.urlopen(base + name, timeout=60) as resp:
+                  data = resp.read()
+              if len(data) != expected['bytes'] or hashlib.sha256(data).hexdigest() != expected['sha256']:
+                  raise SystemExit(f'WCN7850 firmware hash mismatch: {name}')
+              target.write_bytes(data)
+              print(f'staged {target} ({len(data)} bytes)')
+          PY
+          python3 - <<'PY'
+          import pathlib
+          p = pathlib.Path('drivers/Ath12kWifi/tools/fetch-sources.py')
+          p.write_text(p.read_text().replace('"sparse-checkout", "add"', '"sparse-checkout", "set", "--no-cone"'))
+          PY
+          python3 drivers/Ath12kWifi/tools/fetch-sources.py
+          git -C drivers/Ath12kWifi checkout -- tools/fetch-sources.py
+          python3 - <<'PY'
+          import contextlib, hashlib, json, os, pathlib, re, struct, subprocess, sys, tempfile, tomllib, types, uuid
+          pdir = pathlib.Path('scripts/policies/macos-27.3-26C5035r')
+          names = ('App', 'SystemOS', 'OS')
+          if all((pdir / n / 'manifest.header.bin').is_file() and (pdir / n / 'trusted-key.bin').is_file() for n in names):
+              print('VerifiedRoot policy headers already present')
+              raise SystemExit(0)
+          sys.path.insert(0, str(pathlib.Path('../UniXNU/scripts').resolve()))
+          from unixnu.ipsw import Ipsw
+          from unixnu import userdata
+          profile = tomllib.loads((pathlib.Path('../UniXNU/profiles/os') / os.environ['OS_PROFILE'] / 'profile.toml').read_text())
+          with tempfile.TemporaryDirectory() as td:
+              td = pathlib.Path(td)
+              priv, pub = td / 'priv.pem', td / 'pub.pem'
+              subprocess.run(['openssl', 'genpkey', '-algorithm', 'RSA', '-pkeyopt', 'rsa_keygen_bits:3072', '-pkeyopt', 'rsa_keygen_pubexp:65537', '-out', str(priv)], check=True)
+              subprocess.run(['openssl', 'rsa', '-in', str(priv), '-pubout', '-out', str(pub)], check=True)
+              line = subprocess.check_output(['openssl', 'rsa', '-pubin', '-in', str(pub), '-modulus', '-noout'], text=True)
+              modulus = bytes.fromhex(line.strip().split('=', 1)[1])
+              if len(modulus) != 384 or not (modulus[0] & 0x80) or not (modulus[-1] & 1):
+                  raise SystemExit('Invalid RSA-3072 modulus')
+              anchor = b'VROOTKEY' + modulus + b'\x01\x00\x01'
+              anchor_sha = hashlib.sha256(anchor).digest()
+              ctx = types.SimpleNamespace(board=profile, out_root=pathlib.Path('../UniXNU/out').resolve(), option_text=lambda *_: None)
+              src = Ipsw(ctx)
+              comps = {w['name']: w['component'] for w in profile['userdata']['windows']}
+              for name in names:
+                  vpath = pdir / name / 'verification.json'
+                  ver = json.loads(vpath.read_text())
+                  dmg = src.disk_image(comps[name])
+                  for aea in dmg.parent.glob('*.aea'):
+                      aea.unlink(missing_ok=True)
+                  size = userdata.image_size(dmg)
+                  if size != ver['image_bytes']:
+                      raise SystemExit(f'{name}: size {size} != {ver["image_bytes"]}')
+                  img_h, tbl_h = hashlib.sha256(), hashlib.sha256()
+                  count = 0
+                  buf = bytearray()
+                  with contextlib.closing(userdata.disk_blocks(dmg, size)) as blocks:
+                      for chunk in blocks:
+                          img_h.update(chunk)
+                          buf.extend(chunk)
+                          mv = memoryview(buf)
+                          full = (len(mv) // 4096) * 4096
+                          for off in range(0, full, 4096):
+                              tbl_h.update(hashlib.sha256(mv[off:off + 4096]).digest())
+                              count += 1
+                          del mv
+                          if full:
+                              del buf[:full]
+                  if buf:
+                      tbl_h.update(hashlib.sha256(buf).digest())
+                      count += 1
+                  if name != 'OS':
+                      dmg.unlink(missing_ok=True)
+                  if img_h.hexdigest() != ver['image_sha256'] or count != ver['blocks_verified']:
+                      raise SystemExit(f'{name}: image sha256 or block count mismatch')
+                  hdr = struct.pack('<8s4I2Q16s32s32s32sQ', b'VROOT01\0', 1, 160, 4096, 0,
+                                    size, count, uuid.UUID(ver['volume_uuid']).bytes,
+                                    img_h.digest(), tbl_h.digest(), anchor_sha, ver['generation'])
+                  hbin, sbin = td / f'{name}.hdr', td / f'{name}.sig'
+                  hbin.write_bytes(hdr)
+                  subprocess.run(['openssl', 'dgst', '-sha256', '-sign', str(priv), '-out', str(sbin), str(hbin)], check=True)
+                  sig = sbin.read_bytes()
+                  if len(sig) != 384:
+                      raise SystemExit(f'{name}: unexpected signature size {len(sig)}')
+                  (pdir / name / 'manifest.header.bin').write_bytes(hdr + sig)
+                  (pdir / name / 'trusted-key.bin').write_bytes(anchor)
+                  ver['trusted_key_sha256'] = anchor_sha.hex()
+                  vpath.write_text(json.dumps(ver, indent=2) + '\n')
+                  print(f'generated VerifiedRoot header for {name} (table_sha256={tbl_h.hexdigest()})')
+          PY
+      - uses: actions/cache/save@v4
+        if: steps.policy-cache.outputs.cache-hit != 'true'
+        with:
+          path: device/scripts/policies/macos-27.3-26C5035r
+          key: verified-root-policies-v1-macos-27.3-26C5035r
+      - name: save inputs cache
+        if: steps.inputs-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            device/.cache/firmware
+            device/firmware/wcn7850
+          key: ${{ steps.inputs-cache.outputs.cache-primary-key }}
+
+      - name: package
+        working-directory: device
+        env:
+          UNIXNU_UNIQUE_CHIP_ID: ${{ secrets.UNIXNU_UNIQUE_CHIP_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          SKIP_SETUP: ${{ inputs.skip_setup }}
+          MACOS_USER: ${{ secrets.MACOS_USER }}
+        run: |
+          log="$RUNNER_TEMP/package.log"
+          if scripts/package.sh --os "$OS_PROFILE" --uefi ../uefi-sheng 2>&1 | tee "$log"; then
+            exit 0
+          fi
+          # A first installation stops at the runtime step with the command that creates the macOS Data seed as root
+          # (UniXNU scripts/unixnu/runtime.py). Run it once, then package again with the sources already fetched.
+          cmd=$(grep -m1 -E '^[[:space:]]*sudo python3 .*make-macos-data-seed\.py ' "$log" | sed -E 's/^[[:space:]]*sudo //') || true
+          if [ -z "$cmd" ]; then
+            echo "packaging failed" >&2
+            echo "=== Diagnostic Logs from ../$WORK/logs ===" >&2
+            for l in "../$WORK"/logs/*.log; do
+              if [ -f "$l" ]; then
+                echo "--- Errors in $l ---" >&2
+                grep -n -C 5 -E "error:|fatal error:|Error [1-9]|undefined symbol|cannot find" "$l" >&2 || true
+                echo "--- Tail 200 of $l ---" >&2
+                tail -n 200 "$l" >&2
+              fi
+            done
+            exit 1
+          fi
+          read -r -a seed_args <<< "$cmd"
+          # sudo resets PATH; keep the runner's Python 3 (the system one is too old for the build scripts).
+          seed_args[0]=$(command -v python3)
+          if [ "$SKIP_SETUP" = true ]; then
+            account="${MACOS_USER:-unixnu:unixnu}"
+            echo "::add-mask::${account#*:}"
+            seed_args+=(--skip-setup --user "$account")
+          elif [ -n "$MACOS_USER" ]; then
+            echo "::add-mask::${MACOS_USER#*:}"
+            seed_args+=(--user "$MACOS_USER")
+          fi
+          echo "creating the first-install Data seed"
+          sudo "${seed_args[@]}"
+          sudo chown -R "$(id -u):$(id -g)" "../$WORK/runtime"
+          scripts/package.sh --os "$OS_PROFILE" --uefi ../uefi-sheng --no-deps
+      - name: materialize dense images
+        run: |
+          for f in "$WORK/boot/boot.img" "$WORK/payload/payload.img" "$WORK/kernel/kernel.macho" "$WORK/runtime/data.dbr"; do
+            [ -f "$f" ] || continue
+            h1=$(shasum -a 256 "$f" | awk '{print $1}')
+            cat "$f" > "$f.dense"
+            h2=$(shasum -a 256 "$f.dense" | awk '{print $1}')
+            echo "$f: src=$h1 dense=$h2"
+            [ "$h1" = "$h2" ] || { echo "SHA256 mismatch on $f!"; exit 1; }
+            mv "$f.dense" "$f"
+          done
+          ls -lh "$WORK/boot/boot.img" "$WORK/payload/payload.img" "$WORK/kernel/kernel.macho" "$WORK/runtime/data.dbr"
+      - name: diagnostic logs backup
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-macos-logs
+          path: |
+            UniXNU/out/**/*.log
+            /Users/runner/work/_temp/*.log
+          if-no-files-found: ignore
+      - uses: actions/cache/save@v4
+        if: always() && steps.data-cache.outputs.cache-hit != 'true' && hashFiles(format('{0}/runtime/inputs.json', env.WORK)) != ''
+        with:
+          path: |
+            ${{ env.WORK }}/runtime/data.dbr
+            ${{ env.WORK }}/runtime/inputs.json
+          key: ${{ steps.seed-key.outputs.key }}
+      - name: installation seed backup
+        if: always() && hashFiles(format('{0}/runtime/data.dbr', env.WORK)) != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: installation-seed-macos27
+          retention-days: 1
+          path: |
+            ${{ env.WORK }}/runtime/data.dbr
+            ${{ env.WORK }}/runtime/inputs.json
+      - name: images
+        uses: actions/upload-artifact@v4
+        with:
+          name: images-macos27
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            ${{ env.WORK }}/boot/boot.img
+            ${{ env.WORK }}/payload/payload.img
+            ${{ env.WORK }}/kernel/kernel.macho
+            ${{ env.WORK }}/package.manifest.json
+            device/scripts/policies/macos-27.3-26C5035r
+      - name: publish boot release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="macos-27.3-latest"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "macOS 27.3 (26C5035r) Latest Build" \
+              --notes $'Automated macOS 27.3 (26C5035r) build.\n\nReassemble `userdata-root.img` from split parts:\n```sh\ncat userdata-root.img.zst.part-* | zstd -d -o userdata-root.img\n```' \
+              --prerelease || true
+          fi
+          tar -C "device/scripts/policies" -czf "$WORK/policies-macos-27.3-26C5035r.tar.gz" macos-27.3-26C5035r
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$WORK/boot/boot.img" \
+            "$WORK/payload/payload.img" \
+            "$WORK/kernel/kernel.macho" \
+            "$WORK/package.manifest.json" \
+            "$WORK/runtime/data.dbr" \
+            "$WORK/runtime/inputs.json" \
+            "$WORK/policies-macos-27.3-26C5035r.tar.gz"
+      - name: remove proprietary inputs
+        if: always()
+        run: rm -rf UniXNU/out/ipsw UniXNU/out/feeds device/.cache/firmware device/firmware/wcn7850/*.bin
+
+  userdata:
+    if: inputs.userdata
+    runs-on: ${{ inputs.userdata_runner }}
+    timeout-minutes: 240
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: device
+      - uses: actions/checkout@v4
+        with:
+          repository: UniXNU/UniXNU
+          ref: ${{ env.UNIXNU_REF }}
+          path: UniXNU
+          submodules: recursive
+      - name: disk space
+        run: |
+          rm -rf "$HOME/Library/Android" || true
+          df -h "$GITHUB_WORKSPACE"
+      - name: tools
+        run: |
+          brew tap blacktop/tap
+          brew trust blacktop/tap || true
+          brew install --formula blacktop/tap/ipsw
+          command -v zstd >/dev/null || brew install --formula zstd
+          for t in aea ipsw hdiutil zstd gh; do command -v "$t" >/dev/null || { echo "missing tool: $t"; exit 1; }; done
+      - name: userdata image
+        working-directory: UniXNU
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./unixnu build userdata -D ../device --os "$OS_PROFILE" --dry-run
+          ./unixnu build userdata -D ../device --os "$OS_PROFILE"
+          # The decrypted and encrypted disk images are no longer needed; free their space before the upload.
+          rm -rf out/ipsw
+          python3 ../device/scripts/add-userdata-vroot.py "../$WORK/userdata/userdata-root.img"
+          df -h "$GITHUB_WORKSPACE"
+          cat "../$WORK/userdata/userdata-root.json"
+      - name: publish userdata release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="macos-27.3-latest"
+          if ! gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "macOS 27.3 (26C5035r) Latest Build" \
+              --notes $'Automated macOS 27.3 (26C5035r) build.\n\nReassemble `userdata-root.img` from split parts:\n```sh\ncat userdata-root.img.zst.part-* | zstd -d -o userdata-root.img\n```' \
+              --prerelease || true
+          fi
+          for old_asset in $(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name | select(startswith("userdata-root.img.zst.part-"))' || true); do
+            gh release delete-asset "$TAG" "$old_asset" --repo "$GITHUB_REPOSITORY" --yes || true
+          done
+          zstd -1 -T0 -c "$WORK/userdata/userdata-root.img" | split -b 1900m - "$WORK/userdata/userdata-root.img.zst.part-"
+          ls -lh "$WORK/userdata"/userdata-root.img.zst.part-*
+          gh release upload "$TAG" --repo "$GITHUB_REPOSITORY" --clobber \
+            "$WORK/userdata/userdata-root.json" \
+            "$WORK/userdata"/userdata-root.img.zst.part-*
+          rm -f "$WORK/userdata"/userdata-root.img.zst.part-*
+      - name: userdata artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: userdata-macos27
+          retention-days: 1
+          compression-level: 1
+          if-no-files-found: error
+          path: |
+            ${{ env.WORK }}/userdata/userdata-root.img
+            ${{ env.WORK }}/userdata/userdata-root.json
+      - name: remove proprietary inputs
+        if: always()
+        run: rm -rf UniXNU/out
